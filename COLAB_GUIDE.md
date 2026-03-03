@@ -501,14 +501,58 @@ cfg_5m_manifold = ModelConfig(
 
 ## 6. Training
 
-```python
-# Cell 10: Training loop
+### 6.0 Pre-training diagnostics (run this first!)
 
-import time
+```python
+# Cell 10a: Profile a single forward pass BEFORE training
+# This reveals exactly where time is spent and catches issues early.
+
+from lf_ssm.debug_utils import (
+    profile_forward_pass, log_model_summary, log_tensor_stats,
+    log_gpu_memory, check_gradients, DebugTimer, EpochLogger,
+)
 from lf_ssm.losses import TrackingLoss
+import time, sys
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model = model.to(device)
+
+# ── Model summary ─────────────────────────────────────────────────
+log_model_summary(model)
+log_gpu_memory()
+
+# ── Profile one forward pass ──────────────────────────────────────
+# Uses random data — no dataset needed. Shows per-block timings.
+dummy_template = torch.randn(1, 3, 128, 128, device=device)
+dummy_search   = torch.randn(1, 3, 256, 256, device=device)
+timings = profile_forward_pass(model, dummy_template, dummy_search)
+
+# ── Check output tensors ──────────────────────────────────────────
+model.train()
+cls_out, bbox_out = model(dummy_template, dummy_search)
+log_tensor_stats("cls_score", cls_out)
+log_tensor_stats("bbox_pred", bbox_out)
+
+# ── Check gradient flow ──────────────────────────────────────────
+loss = cls_out.mean() + bbox_out.mean()
+loss.backward()
+check_gradients(model)
+log_gpu_memory()
+
+print("\n✅ Pre-training diagnostics complete!")
+print(f"   Estimated time per batch (batch_size=16): "
+      f"~{timings['total'] * 16:.1f}s forward + similar backward")
+print(f"   → ~{timings['total'] * 16 * 2:.1f}s total per batch")
+
+del dummy_template, dummy_search, cls_out, bbox_out, loss
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+```
+
+### 6.1 Training loop with verbose debugging
+
+```python
+# Cell 10b: Training functions with per-batch progress
 
 # Optimizer (§6.1.3: AdamW, lr=1e-4, weight_decay=1e-4)
 optimizer = torch.optim.AdamW(
@@ -529,13 +573,20 @@ criterion = TrackingLoss(
     lambda_l1=cfg_5m.lambda_l1,
 ).to(device)
 
+# ── How often to print batch progress ─────────────────────────────
+PRINT_EVERY = 5  # Print every N batches (set to 1 for maximum verbosity)
+
 
 def train_one_epoch(model, loader, optimizer, criterion, device, epoch):
+    """Train for one epoch with per-batch progress logging."""
     model.train()
-    total_loss = 0
-    num_batches = 0
+    logger = EpochLogger(
+        num_batches=len(loader), epoch=epoch, print_every=PRINT_EVERY,
+    )
 
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader):
+        batch_start = time.perf_counter()
+
         template = batch['template'].to(device)   # (B, 3, 128, 128)
         search   = batch['search'].to(device)      # (B, 3, 256, 256)
         bbox_gt  = batch['bbox'].to(device)         # (B, 4)
@@ -544,10 +595,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch):
         # Forward
         cls_pred, bbox_pred = model(template, search)
 
-        # Classification loss uses the full spatial map
-        # Regression loss uses the center prediction
         # Get center bbox from prediction map
-        B = bbox_pred.shape[0]
         feat_size = bbox_pred.shape[-1]
         center = feat_size // 2
         bbox_center_pred = bbox_pred[:, :, center, center]  # (B, 4)
@@ -560,71 +608,111 @@ def train_one_epoch(model, loader, optimizer, criterion, device, epoch):
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
-        total_loss += losses['total'].item()
-        num_batches += 1
+        # ── Log progress ──────────────────────────────────────────
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        batch_time = time.perf_counter() - batch_start
 
-    return total_loss / max(num_batches, 1)
+        loss_dict = {k: v.item() for k, v in losses.items()}
+        logger.log_batch(batch_idx, batch_time, loss_dict)
+
+        # Extra diagnostics on first batch of first epoch
+        if batch_idx == 0 and epoch == 1:
+            print("    ── First batch diagnostics ──")
+            log_tensor_stats("    cls_pred", cls_pred)
+            log_tensor_stats("    bbox_pred", bbox_pred)
+            log_tensor_stats("    bbox_gt", bbox_gt)
+            check_gradients(model, top_k=3)
+            print("    ── End first batch diagnostics ──")
+
+    return logger.summarise()
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device):
+def validate(model, loader, criterion, device, epoch):
+    """Validate with progress logging."""
     model.eval()
-    total_loss = 0
-    num_batches = 0
+    logger = EpochLogger(
+        num_batches=len(loader), epoch=epoch, print_every=max(1, len(loader) // 3),
+    )
 
-    for batch in loader:
+    for batch_idx, batch in enumerate(loader):
+        batch_start = time.perf_counter()
+
         template = batch['template'].to(device)
         search   = batch['search'].to(device)
         bbox_gt  = batch['bbox'].to(device)
         cls_gt   = batch['cls_label'].to(device)
 
         cls_pred, bbox_pred = model(template, search)
-        B = bbox_pred.shape[0]
         feat_size = bbox_pred.shape[-1]
         center = feat_size // 2
         bbox_center_pred = bbox_pred[:, :, center, center]
 
         losses = criterion(cls_pred, cls_gt, bbox_center_pred, bbox_gt)
-        total_loss += losses['total'].item()
-        num_batches += 1
 
-    return total_loss / max(num_batches, 1)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        batch_time = time.perf_counter() - batch_start
+
+        loss_dict = {k: v.item() for k, v in losses.items()}
+        logger.log_batch(batch_idx, batch_time, loss_dict)
+
+    return logger.summarise()
 ```
 
+### 6.2 Run training
+
 ```python
-# Cell 11: Run training
+# Cell 11: Run training with full logging
 
 best_val_loss = float('inf')
+print("=" * 70)
+print(f"STARTING TRAINING: {num_epochs} epochs, {len(train_loader)} batches/epoch")
+print(f"Device: {device} | Batch size: {train_loader.batch_size}")
+print(f"Model: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M params")
+print("=" * 70)
 
 for epoch in range(1, num_epochs + 1):
-    t0 = time.time()
+    epoch_start = time.time()
 
-    train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch)
-    val_loss = validate(model, val_loader, criterion, device)
+    # ── Train ─────────────────────────────────────────────────────
+    print(f"\n{'─' * 70}")
+    print(f"EPOCH {epoch}/{num_epochs}  (lr={optimizer.param_groups[0]['lr']:.2e})")
+    print(f"{'─' * 70}")
+    print("[Train]")
+    train_losses = train_one_epoch(
+        model, train_loader, optimizer, criterion, device, epoch)
+
+    # ── Validate ──────────────────────────────────────────────────
+    print("[Val]")
+    val_losses = validate(model, val_loader, criterion, device, epoch)
+
     scheduler.step()
-
-    elapsed = time.time() - t0
+    elapsed = time.time() - epoch_start
     lr = optimizer.param_groups[0]['lr']
 
-    print(f"Epoch {epoch:3d}/{num_epochs} | "
-          f"Train Loss: {train_loss:.4f} | "
-          f"Val Loss: {val_loss:.4f} | "
-          f"LR: {lr:.2e} | "
-          f"Time: {elapsed:.1f}s")
+    # ── Epoch summary ─────────────────────────────────────────────
+    train_total = train_losses.get('total', 0)
+    val_total = val_losses.get('total', 0)
+    print(f"\n📊 Epoch {epoch:3d}/{num_epochs} SUMMARY: "
+          f"Train={train_total:.4f} Val={val_total:.4f} "
+          f"LR={lr:.2e} Time={elapsed:.1f}s")
+    log_gpu_memory()
 
-    # Save best model
-    if val_loss < best_val_loss:
-        best_val_loss = val_loss
+    # ── Save best model ───────────────────────────────────────────
+    if val_total < best_val_loss:
+        best_val_loss = val_total
         torch.save({
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'val_loss': val_loss,
+            'val_loss': val_total,
             'config': cfg_5m,
         }, '/content/best_lf_ssm_5m.pth')
-        print(f"  ✅ Best model saved (val_loss={val_loss:.4f})")
+        print(f"  ✅ Best model saved (val_loss={val_total:.4f})")
 
-    # Save periodic checkpoint
+    # ── Periodic checkpoint ───────────────────────────────────────
     if epoch % 10 == 0:
         torch.save({
             'epoch': epoch,
@@ -633,6 +721,9 @@ for epoch in range(1, num_epochs + 1):
             'scheduler_state_dict': scheduler.state_dict(),
             'config': cfg_5m,
         }, f'/content/checkpoint_epoch{epoch}.pth')
+        print(f"  💾 Checkpoint saved: checkpoint_epoch{epoch}.pth")
+
+    sys.stdout.flush()
 ```
 
 ---

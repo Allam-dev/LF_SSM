@@ -11,6 +11,15 @@ HiPPO-derived state transition matrices and specialized hardware kernels.
 
 from lf_ssm.config import ModelConfig, LF_SSM_S, LF_SSM_M, LF_SSM_L, LF_SSM_Nano
 from lf_ssm.lf_ssm_model import LFSSM
+from lf_ssm.debug_utils import (
+    DebugTimer,
+    log_tensor_stats,
+    check_gradients,
+    log_gpu_memory,
+    log_model_summary,
+    profile_forward_pass,
+    EpochLogger,
+)
 
 __all__ = [
     "ModelConfig",
@@ -19,4 +28,11 @@ __all__ = [
     "LF_SSM_L",
     "LF_SSM_Nano",
     "LFSSM",
+    "DebugTimer",
+    "log_tensor_stats",
+    "check_gradients",
+    "log_gpu_memory",
+    "log_model_summary",
+    "profile_forward_pass",
+    "EpochLogger",
 ]
