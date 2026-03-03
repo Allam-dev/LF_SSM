@@ -205,10 +205,14 @@ class UAVTrackingDataset(Dataset):
             for line in lines:
                 line = line.strip()
                 if not line:
+                    bboxes.append([float('nan')] * 4)  # placeholder for empty lines
                     continue
                 parts = line.replace(',', ' ').split()
                 if len(parts) >= 4:
-                    bboxes.append([float(p) for p in parts[:4]])
+                    vals = [float(p) for p in parts[:4]]
+                    bboxes.append(vals)
+                else:
+                    bboxes.append([float('nan')] * 4)
 
             # Get sorted frame paths
             frames = sorted(glob.glob(os.path.join(seq_dir, '*.jpg')))
@@ -217,20 +221,28 @@ class UAVTrackingDataset(Dataset):
 
             if len(bboxes) > 0 and len(frames) > 0:
                 n = min(len(frames), len(bboxes))
+                bboxes_arr = np.array(bboxes[:n])  # (N, 4): x, y, w, h
                 self.sequences.append({
                     'name': seq_name,
                     'frames': frames[:n],
-                    'bboxes': np.array(bboxes[:n]),  # (N, 4): x, y, w, h
+                    'bboxes': bboxes_arr,
                 })
 
         print(f"Loaded {len(self.sequences)} sequences")
 
-        # Build index: (seq_idx, frame_idx) for all valid frames
+        # Build index: (seq_idx, frame_idx) — only for frames with valid bboxes
         self.samples = []
+        skipped = 0
         for si, seq in enumerate(self.sequences):
-            n_frames = len(seq['frames'])
-            for fi in range(n_frames):
+            bboxes = seq['bboxes']
+            for fi in range(len(seq['frames'])):
+                bbox = bboxes[fi]
+                # Skip frames with NaN, zero-area, or negative bboxes
+                if np.any(np.isnan(bbox)) or bbox[2] <= 0 or bbox[3] <= 0:
+                    skipped += 1
+                    continue
                 self.samples.append((si, fi))
+        print(f"Valid samples: {len(self.samples)} (skipped {skipped} invalid frames)")
 
         self.transform = T.Compose([
             T.ToTensor(),
@@ -244,8 +256,14 @@ class UAVTrackingDataset(Dataset):
     def _crop_and_resize(self, image, bbox, crop_size, factor):
         """Crop a region around bbox and resize to crop_size."""
         x, y, w, h = bbox
+        # Guard against NaN or invalid bboxes — fall back to image center
+        img_h, img_w = image.shape[:2]
+        if np.any(np.isnan([x, y, w, h])) or w <= 0 or h <= 0:
+            x, y = img_w * 0.25, img_h * 0.25
+            w, h = img_w * 0.5, img_h * 0.5
         cx, cy = x + w / 2, y + h / 2
         s = max(w, h) * factor
+        s = max(s, 1.0)  # ensure s is never zero
         # Crop region
         x1 = int(cx - s / 2)
         y1 = int(cy - s / 2)
@@ -299,18 +317,32 @@ class UAVTrackingDataset(Dataset):
                 label[0, i, j] = np.exp(-dist_sq / (2 * 0.05 ** 2))
         return torch.from_numpy(label)
 
+    def _is_valid_bbox(self, bbox):
+        """Check if a bounding box is valid (no NaN, positive area)."""
+        return (not np.any(np.isnan(bbox))) and bbox[2] > 0 and bbox[3] > 0
+
+    def _find_valid_search_frame(self, seq, frame_idx):
+        """Find a nearby frame with a valid bbox for use as search frame."""
+        n_frames = len(seq['frames'])
+        # Try random frames within max_gap, up to 20 attempts
+        for _ in range(20):
+            lo = max(0, frame_idx - self.max_gap)
+            hi = min(n_frames - 1, frame_idx + self.max_gap)
+            candidate = random.randint(lo, hi)
+            if self._is_valid_bbox(seq['bboxes'][candidate]):
+                return candidate
+        # Fallback: use the template frame itself (guaranteed valid by sample index)
+        return frame_idx
+
     def __getitem__(self, idx):
         seq_idx, frame_idx = self.samples[idx]
         seq = self.sequences[seq_idx]
 
-        # Template frame = current frame
+        # Template frame = current frame (guaranteed valid by sample index)
         template_frame_idx = frame_idx
 
-        # Search frame = random nearby frame
-        n_frames = len(seq['frames'])
-        lo = max(0, frame_idx - self.max_gap)
-        hi = min(n_frames - 1, frame_idx + self.max_gap)
-        search_frame_idx = random.randint(lo, hi)
+        # Search frame = random nearby frame with valid bbox
+        search_frame_idx = self._find_valid_search_frame(seq, frame_idx)
 
         # Load images
         template_img = np.array(Image.open(seq['frames'][template_frame_idx]).convert('RGB'))
@@ -395,6 +427,11 @@ The default LF-SSM-S has ~18.5M parameters. To get **~5M parameters**, reduce th
 
 ```python
 # Cell 9: Create ~5M parameter model
+
+# ⚠️ IMPORTANT: Make sure LF_SSM is in Python path
+# (adjust the path if you placed the code in a different location)
+import sys
+sys.path.insert(0, '/content/LF_SSM')
 
 from lf_ssm import ModelConfig, LFSSM
 
